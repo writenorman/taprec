@@ -43,7 +43,7 @@ The old approach is preserved in [`legacy/`](legacy/) with its diagnostics, and
 ## Install
 
 ```bash
-git clone <your-repo-url> taprec
+git clone https://github.com/writenorman/taprec.git
 cd taprec
 ./taprec --install      # fetches a prebuilt AudioTee binary, no Xcode needed
 ./taprec --check        # verify the tap works
@@ -249,6 +249,16 @@ legacy/
 docs/
   CLEANUP.md            removing BlackHole and friends
 ```
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
+AudioTee is MIT-licensed too, and is fetched at install time into your own
+home directory rather than bundled here. `ffmpeg` is a runtime dependency,
+invoked as a separate process and not redistributed.
 
 ---
 
