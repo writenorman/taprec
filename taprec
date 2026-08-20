@@ -1,0 +1,869 @@
+#!/usr/bin/env bash
+#
+# taprec — record macOS system audio to a file, via Core Audio taps.
+#
+# Uses AudioTee (https://github.com/makeusabrew/audiotee), a Swift CLI wrapping
+# Apple's Core Audio process-tap API, and pipes its PCM into ffmpeg.
+#
+# Nothing is rerouted: no virtual driver, no aggregate device, no output
+# switching. Your audio keeps playing exactly as it was while this records.
+#
+# See README.md for setup, or run `taprec --help`.
+#
+set -euo pipefail
+
+TAPREC_VERSION="1.0.0"
+
+# ---------------------------------------------------------------- defaults ---
+
+OUT_DIR="${TAPREC_DIR:-./recordings}"
+OUT_FILE=""
+FORMAT="wav"
+DURATION=""
+SAMPLE_RATE="48000"
+STEREO=1
+MUTE=0
+ONLY_PIDS=()
+SKIP_PIDS=()
+CHUNK=""
+MODE="record"
+FROM_SOURCE=0
+OPEN_AFTER=0
+PROBE_SAW_METADATA=0
+
+AUDIOTEE_HOME="${AUDIOTEE_HOME:-$HOME/.local/share/audiotee}"
+AUDIOTEE_BIN="${AUDIOTEE_BIN:-}"
+
+FIFO=""
+LOG=""
+PROGRESS_FILE=""
+AT_PID=""
+TIMER_PID=""
+
+# ------------------------------------------------------------------- utils ---
+
+c_red() { printf '\033[31m%s\033[0m\n' "$*" >&2; }
+c_grn() { printf '\033[32m%s\033[0m\n' "$*"; }
+c_ylw() { printf '\033[33m%s\033[0m\n' "$*"; }
+c_dim() { printf '\033[2m%s\033[0m\n' "$*"; }
+die()   { c_red "error: $*"; exit 1; }
+
+usage() {
+  cat <<EOF
+taprec $TAPREC_VERSION — record macOS system audio via Core Audio taps
+
+USAGE
+  taprec [options]
+
+RECORDING
+  -t, --duration SECS   stop after SECS seconds (default: until Ctrl-C)
+  -o, --output FILE     write to FILE
+  -d, --dir DIR         directory for auto-named files (default: $OUT_DIR)
+  -f, --format FMT      wav | m4a | mp3 | flac            (default: $FORMAT)
+  -r, --rate HZ         8000|16000|22050|24000|32000|44100|48000 (default: $SAMPLE_RATE)
+      --stereo          record in stereo                  (default)
+      --mono            record in mono
+      --open            reveal the finished file in Finder
+
+CAPTURE SCOPE
+      --only-pid PID    capture only this process (repeatable)
+      --skip-pid PID    capture everything except this process (repeatable)
+      --mute            silence the tapped apps while recording
+
+SETUP & DIAGNOSTICS
+      --install         install AudioTee (prebuilt binary; no Xcode needed)
+      --install --from-source
+                        build AudioTee from source (needed for stereo)
+      --check           verify the tap works and report its format
+      --toolchain       report Swift/SDK versions and stereo build readiness
+  -h, --help            this help
+  -v, --version         print version
+
+CONFIG
+  Defaults can be set in ~/.config/taprec/config, e.g.
+
+      FORMAT=m4a
+      SAMPLE_RATE=48000
+      OUT_DIR=~/Recordings
+      STEREO=1
+
+  Environment variables override the file; flags override everything.
+
+NOTES
+  macOS grants audio-capture permission to your TERMINAL app, not to this
+  script. If recordings come out silent, see the Permissions section of the
+  README.
+
+EXAMPLES
+  taprec -t 60                    # one minute to ./recordings/
+  taprec -f m4a -o interview.m4a  # AAC, explicit filename
+  taprec --only-pid \$(pgrep -x Music)   # just the Music app
+EOF
+  exit 0
+}
+
+# Config file: simple KEY=VALUE, applied before flags so flags always win.
+load_config() {
+  local cfg="${TAPREC_CONFIG:-$HOME/.config/taprec/config}"
+  [[ -f "$cfg" ]] || return 0
+  local key value
+  while IFS='=' read -r key value; do
+    key="$(printf '%s' "$key" | tr -d '[:space:]')"
+    [[ -z "$key" || "$key" == \#* ]] && continue
+    value="$(printf '%s' "$value" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/^"//; s/"$//')"
+    value="${value/#\~/$HOME}"
+    case "$key" in
+      FORMAT)      FORMAT="$value" ;;
+      SAMPLE_RATE) SAMPLE_RATE="$value" ;;
+      OUT_DIR)     OUT_DIR="$value" ;;
+      STEREO)      STEREO="$value" ;;
+      MUTE)        MUTE="$value" ;;
+      CHUNK)       CHUNK="$value" ;;
+      *) ;;   # ignore unknown keys rather than failing on a stray line
+    esac
+  done < "$cfg"
+  return 0
+}
+load_config
+
+cleanup() {
+  if [[ -n "$TIMER_PID" ]]; then kill "$TIMER_PID" 2>/dev/null || true; fi
+  if [[ -n "$AT_PID" ]] && kill -0 "$AT_PID" 2>/dev/null; then
+    kill -INT "$AT_PID" 2>/dev/null || true
+  fi
+  if [[ -n "$FIFO" ]]; then rm -f "$FIFO"; fi
+  if [[ -n "$PROGRESS_FILE" ]]; then rm -f "$PROGRESS_FILE"; fi
+  # $LOG is deliberately kept on failure paths; removed only on clean exit.
+  #
+  # Explicit success: an EXIT trap whose last command short-circuits to false
+  # overwrites the script's real exit status. That silently turned a passing
+  # --check into exit 1.
+  return 0
+}
+trap cleanup EXIT INT TERM
+
+# --------------------------------------------------------------- arg parse ---
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -o|--output)    OUT_FILE="${2:-}";    shift 2 ;;
+    -d|--dir)       OUT_DIR="${2:-}";     shift 2 ;;
+    -f|--format)    FORMAT="${2:-}";      shift 2 ;;
+    -t|--duration)  DURATION="${2:-}";    shift 2 ;;
+    -r|--rate)      SAMPLE_RATE="${2:-}"; shift 2 ;;
+    --chunk)        CHUNK="${2:-}";       shift 2 ;;
+    --mono)         STEREO=0;             shift ;;
+    --stereo)       STEREO=1;             shift ;;
+    --mute)         MUTE=1;               shift ;;
+    --only-pid)     ONLY_PIDS+=("${2:-}");shift 2 ;;
+    --skip-pid)     SKIP_PIDS+=("${2:-}");shift 2 ;;
+    --install)      MODE="install";       shift ;;
+    --from-source)  FROM_SOURCE=1;        shift ;;
+    --check)        MODE="check";         shift ;;
+    --toolchain)    MODE="toolchain";     shift ;;
+    --open)         OPEN_AFTER=1;         shift ;;
+    -v|--version)   echo "taprec $TAPREC_VERSION"; exit 0 ;;
+    -h|--help)      usage ;;
+    *)              die "unknown option: $1 (try --help)" ;;
+  esac
+done
+
+# ------------------------------------------------------- platform / locate ---
+
+check_macos_version() {
+  [[ "$(uname -s)" == "Darwin" ]] || die "this script only works on macOS"
+  local ver major minor rest
+  ver="$(sw_vers -productVersion 2>/dev/null || echo 0)"
+  major="${ver%%.*}"
+  rest="${ver#*.}"
+  if [[ "$rest" == "$ver" ]]; then minor=0; else minor="${rest%%.*}"; fi
+  # Core Audio taps landed in macOS 14.2; there is no fallback below that.
+  if [[ "$major" -lt 14 ]] || { [[ "$major" -eq 14 ]] && [[ "$minor" -lt 2 ]]; }; then
+    die "Core Audio taps need macOS 14.2 or later (you have $ver)"
+  fi
+}
+
+find_audiotee() {
+  if [[ -n "$AUDIOTEE_BIN" && -x "$AUDIOTEE_BIN" ]]; then
+    printf '%s' "$AUDIOTEE_BIN"; return 0
+  fi
+  # Our own managed install wins over anything on PATH. Otherwise a stray
+  # `audiotee` elsewhere silently shadows the binary --install just produced,
+  # and you get the old build's behaviour right after upgrading.
+  local candidate
+  for candidate in \
+    "$AUDIOTEE_HOME/bin/audiotee" \
+    "$AUDIOTEE_HOME/src/.build/release/audiotee" \
+    "$AUDIOTEE_HOME/.build/release/audiotee" \
+    "$(command -v audiotee 2>/dev/null || true)" \
+    "./audiotee/.build/release/audiotee" \
+    "./.build/release/audiotee"
+  do
+    if [[ -n "$candidate" && -x "$candidate" ]]; then printf '%s' "$candidate"; return 0; fi
+  done
+  return 1
+}
+
+# Is a given developer dir new enough? Pass "" for whatever xcode-select points
+# at. Two gates: Swift >= 5.9 parses AudioTee's manifest, and the macOS SDK
+# >= 14.2 actually contains the Core Audio taps API. The SDK is the real one —
+# an older SDK simply has no AudioHardwareCreateProcessTap to link against.
+toolchain_ok() {
+  local dir="$1" sv sdk maj mnr
+  if [[ -n "$dir" ]]; then
+    sv="$(DEVELOPER_DIR="$dir" swift --version 2>&1 | sed -n 's/.*Swift version \([0-9][0-9.]*\).*/\1/p' | head -n1)"
+    sdk="$(DEVELOPER_DIR="$dir" xcrun --show-sdk-version 2>/dev/null || true)"
+  else
+    sv="$(swift --version 2>&1 | sed -n 's/.*Swift version \([0-9][0-9.]*\).*/\1/p' | head -n1)"
+    sdk="$(xcrun --show-sdk-version 2>/dev/null || true)"
+  fi
+  TC_SWIFT="$sv"; TC_SDK="$sdk"
+  [[ -n "$sv" && -n "$sdk" ]] || return 1
+
+  maj="${sv%%.*}"; mnr="$(printf '%s' "$sv" | cut -d. -f2)"; [[ -n "$mnr" ]] || mnr=0
+  if [[ "$maj" -lt 5 ]] || { [[ "$maj" -eq 5 ]] && [[ "$mnr" -lt 9 ]]; }; then return 1; fi
+
+  maj="${sdk%%.*}"; mnr="$(printf '%s' "$sdk" | cut -d. -f2)"; [[ -n "$mnr" ]] || mnr=0
+  if [[ "$maj" -lt 14 ]] || { [[ "$maj" -eq 14 ]] && [[ "$mnr" -lt 2 ]]; }; then return 1; fi
+  return 0
+}
+
+# Find a usable toolchain without changing the user's global xcode-select.
+# DEVELOPER_DIR overrides it per-invocation, so if the Command Line Tools are
+# newer than the selected Xcode we can just build against them and leave the
+# rest of their development setup exactly as it was.
+pick_toolchain() {
+  TOOLCHAIN_DIR=""
+  if toolchain_ok ""; then
+    c_dim "  toolchain: active (Swift $TC_SWIFT, SDK $TC_SDK)"
+    return 0
+  fi
+  local active_sv="$TC_SWIFT" active_sdk="$TC_SDK"
+
+  if [[ -d /Library/Developer/CommandLineTools ]] && toolchain_ok /Library/Developer/CommandLineTools; then
+    TOOLCHAIN_DIR=/Library/Developer/CommandLineTools
+    c_dim "  active toolchain too old (Swift ${active_sv:-?}, SDK ${active_sdk:-?})"
+    c_grn "  using Command Line Tools instead (Swift $TC_SWIFT, SDK $TC_SDK)"
+    c_dim "  via DEVELOPER_DIR for this build only — your xcode-select is untouched"
+    return 0
+  fi
+
+  echo
+  c_red "No toolchain new enough to build AudioTee."
+  echo "  active        : Swift ${active_sv:-?} / SDK ${active_sdk:-?}  ($(xcode-select -p 2>/dev/null))"
+  if [[ -d /Library/Developer/CommandLineTools ]]; then
+    echo "  CommandLineTools: Swift ${TC_SWIFT:-?} / SDK ${TC_SDK:-?}  (also too old)"
+  else
+    echo "  CommandLineTools: not installed"
+  fi
+  cat <<'EOF'
+
+  Needed: Swift >= 5.9 AND macOS SDK >= 14.2.
+
+  Cheapest fix — Command Line Tools only (~1-2 GB, enough to build a SwiftPM
+  package; you do NOT need full Xcode):
+
+    1. Download "Command Line Tools for Xcode" (current version) from
+       https://developer.apple.com/download/all/     [free Apple ID]
+    2. Install it, then re-run:  --install --from-source
+
+    No xcode-select change needed — this script will find and use them.
+
+  Alternative: update Xcode from the App Store (much larger, but also updates
+  the toolchain your other projects use).
+
+  Meanwhile the prebuilt mono binary keeps working:  --install
+
+EOF
+  return 1
+}
+
+install_from_source() {
+  check_macos_version
+  command -v git >/dev/null 2>&1   || die "git not found"
+  command -v swift >/dev/null 2>&1 || die "swift not found — install Xcode command line tools: xcode-select --install"
+
+  c_dim "checking toolchain…"
+  pick_toolchain || exit 1
+
+  # Source checkout lives in a SUBdirectory, never in $AUDIOTEE_HOME itself:
+  # the prebuilt install puts a binary in $AUDIOTEE_HOME/bin, so cloning into
+  # $AUDIOTEE_HOME fails outright ("destination path already exists and is not
+  # an empty directory"). Both install methods now converge on one active
+  # binary at $AUDIOTEE_HOME/bin/audiotee.
+  local src="$AUDIOTEE_HOME/src"
+  local dest="$AUDIOTEE_HOME/bin/audiotee"
+
+  if [[ -d "$src/.git" ]]; then
+    c_dim "updating existing checkout in $src"
+    git -C "$src" pull --ff-only || c_ylw "pull failed; building what is already there"
+  else
+    rm -rf "$src"
+    mkdir -p "$AUDIOTEE_HOME"
+    c_dim "cloning AudioTee into $src"
+    # HTTPS, not the SSH URL in their README — no key needed.
+    git clone --depth 1 https://github.com/makeusabrew/audiotee.git "$src"
+  fi
+
+  c_dim "building with Swift ${TC_SWIFT} / SDK ${TC_SDK} (first build takes a minute)…"
+  if [[ -n "$TOOLCHAIN_DIR" ]]; then
+    ( cd "$src" && DEVELOPER_DIR="$TOOLCHAIN_DIR" swift build -c release )
+  else
+    ( cd "$src" && swift build -c release )
+  fi
+
+  local built="$src/.build/release/audiotee"
+  [[ -x "$built" ]] || die "build finished but $built is missing"
+
+  # Keep the known-good prebuilt so a bad source build is one command from
+  # being undone.
+  mkdir -p "$AUDIOTEE_HOME/bin"
+  if [[ -x "$dest" ]] && [[ ! -e "$dest.prebuilt" ]]; then
+    cp "$dest" "$dest.prebuilt"
+    c_dim "  saved the previous binary as $(basename "$dest").prebuilt"
+  fi
+
+  cp "$built" "$dest.new"
+  chmod +x "$dest.new"
+  if ! "$dest.new" --help >/dev/null 2>&1; then
+    c_red "the freshly built binary will not run; keeping the existing one."
+    rm -f "$dest.new"
+    return 1
+  fi
+  mv "$dest.new" "$dest"
+
+  c_grn "✔ AudioTee built from source: $dest"
+  if "$dest" --help 2>&1 | grep -q -- '--stereo'; then
+    c_grn "  this build supports --stereo"
+  else
+    c_ylw "  note: this build still has no --stereo flag."
+    c_dim "  the upstream source may have changed; recording stays mono."
+  fi
+  echo
+  c_dim "next: $0 --check"
+}
+
+install_audiotee() {
+  check_macos_version
+  if [[ "$FROM_SOURCE" -eq 0 ]]; then
+    if install_prebuilt; then return 0; fi
+    c_ylw "prebuilt install unavailable — falling back to building from source."
+    echo
+  fi
+  install_from_source
+}
+
+# ------------------------------------------------------------ audiotee args --
+
+# Ask the binary what it supports instead of assuming. The npm prebuilt (0.0.7)
+# predates the GitHub source: it has no --stereo at all, and passing it makes the
+# binary exit with "Unknown option" before doing anything. Different builds of
+# this tool are in circulation, so probe rather than hardcode.
+detect_capabilities() {
+  local help
+  help="$("$AUDIOTEE" --help 2>&1 || true)"
+  HAS_STEREO=0
+  HAS_MUTE=0
+  HAS_CHUNK=0
+  case "$help" in *--stereo*) HAS_STEREO=1 ;; esac
+  case "$help" in *--mute*) HAS_MUTE=1 ;; esac
+  case "$help" in *--chunk-duration*) HAS_CHUNK=1 ;; esac
+  return 0
+}
+
+build_audiotee_args() {
+  # `if` blocks rather than `[[ ]] && ...`: under `set -e` a false short-circuit
+  # as a function's last statement makes the function return 1 and kills the
+  # script silently.
+  AT_ARGS=(--sample-rate "$SAMPLE_RATE")
+
+  if [[ "$STEREO" -eq 1 ]]; then
+    if [[ "$HAS_STEREO" -eq 1 ]]; then
+      AT_ARGS+=(--stereo)
+    else
+      c_ylw "note: this AudioTee build has no --stereo; recording mono."
+      c_dim "      the npm prebuilt is mono-only. For stereo, build the current"
+      c_dim "      source instead: $0 --install --from-source"
+      STEREO=0
+    fi
+  fi
+
+  if [[ "$MUTE" -eq 1 ]]; then
+    if [[ "$HAS_MUTE" -eq 1 ]]; then
+      AT_ARGS+=(--mute)
+    else
+      c_ylw "note: this AudioTee build has no --mute; ignoring it."
+      MUTE=0
+    fi
+  fi
+
+  if [[ -n "$CHUNK" && "$HAS_CHUNK" -eq 1 ]]; then AT_ARGS+=(--chunk-duration "$CHUNK"); fi
+
+  if [[ "${#ONLY_PIDS[@]}" -gt 0 ]]; then
+    AT_ARGS+=(--include-processes "${ONLY_PIDS[@]}")
+  elif [[ "${#SKIP_PIDS[@]}" -gt 0 ]]; then
+    AT_ARGS+=(--exclude-processes "${SKIP_PIDS[@]}")
+  fi
+  return 0
+}
+
+# Run the tap briefly and read the metadata message to learn the ACTUAL wire
+# format. Guessing the channel count is how you get a file that plays at the
+# wrong speed: tell ffmpeg 2 channels when the stream is mono and every frame is
+# misread. The tool reports its format — use that.
+#
+# This has to be a separate short run because AudioTee's stdout is redirected to
+# a FIFO, and opening a FIFO for writing blocks until a reader appears, so it
+# cannot emit anything until ffmpeg is already running with parameters chosen.
+probe_stream_format() {
+  local plog waited
+  plog="$(mktemp "${TMPDIR:-/tmp}/audiotee-probe.XXXXXX")"
+
+  "$AUDIOTEE" "${AT_ARGS[@]}" >/dev/null 2>"$plog" &
+  local pid=$!
+  waited=0
+  while [[ "$waited" -lt 120 ]]; do
+    if grep -q '"metadata"' "$plog" 2>/dev/null; then break; fi
+    if grep -qE '"(message_)?type"[[:space:]]*:[[:space:]]*"error"' "$plog" 2>/dev/null; then break; fi
+    if ! kill -0 "$pid" 2>/dev/null; then break; fi
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  # Grace period before killing: the loop may exit on the same tick the tap is
+  # about to announce itself, and killing instantly truncates the log.
+  sleep 0.5
+  kill -INT "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  sleep 0.2   # let the OS flush stderr
+
+  local parsed
+  parsed="$(python3 - "$plog" <<'PYEOF' 2>/dev/null || true
+import json, sys
+for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
+    line = line.strip()
+    if not line.startswith("{"):
+        continue
+    try:
+        m = json.loads(line)
+    except Exception:
+        continue
+    if (m.get("type") or m.get("message_type")) == "metadata":
+        d = m.get("data") or {}
+        print("%s %s %s" % (d.get("sample_rate"), d.get("channels_per_frame"), d.get("encoding")))
+        break
+PYEOF
+)"
+
+  if [[ -z "$parsed" ]]; then
+    # NOT fatal. The wire format is fully determined by the flags we pass:
+    # --sample-rate always yields pcm_s16le at that rate, and channels follow
+    # from whether this build supports --stereo. The probe is a cross-check, not
+    # a requirement, and making it fatal turned a working tap into a hard stop.
+    c_ylw "could not read the tap's format from its log; using the expected format."
+    if grep -q '"metadata"' "$plog" 2>/dev/null; then
+      c_dim "  (a metadata line WAS present but could not be parsed — please report this)"
+    else
+      c_dim "  (no metadata line appeared within the probe window)"
+    fi
+    c_dim "  full probe log: $plog"
+    PROBE_SAW_METADATA=0
+    DETECTED_RATE="$SAMPLE_RATE"
+    DETECTED_CH=1
+    if [[ "$STEREO" -eq 1 ]]; then DETECTED_CH=2; fi
+    DETECTED_ENC="pcm_s16le"
+    FFMPEG_INFMT="s16le"
+    return 0
+  fi
+
+  PROBE_SAW_METADATA=1
+  DETECTED_RATE="$(printf '%s' "$parsed" | awk '{print $1}' | cut -d. -f1)"
+  DETECTED_CH="$(printf '%s' "$parsed" | awk '{print $2}')"
+  DETECTED_ENC="$(printf '%s' "$parsed" | awk '{print $3}')"
+  rm -f "$plog"
+
+  case "$DETECTED_ENC" in
+    pcm_s16le) FFMPEG_INFMT="s16le" ;;
+    pcm_f32le) FFMPEG_INFMT="f32le" ;;
+    *) c_ylw "unrecognised encoding '$DETECTED_ENC'; assuming s16le"; FFMPEG_INFMT="s16le" ;;
+  esac
+  return 0
+}
+
+# AudioTee writes newline-delimited JSON to stderr. The metadata message states
+# the exact wire format, so we can verify rather than assume.
+report_stream_format() {
+  local log="$1"
+  [[ -s "$log" ]] || return 0
+  python3 - "$log" <<'PY' 2>/dev/null || true
+import json, sys
+for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
+    line = line.strip()
+    if not line.startswith("{"):
+        continue
+    try:
+        msg = json.loads(line)
+    except Exception:
+        continue
+    if (msg.get("type") or msg.get("message_type")) == "metadata":
+        d = msg.get("data") or {}
+        print("  stream: %s Hz, %s ch, %s" % (
+            d.get("sample_rate"), d.get("channels_per_frame"), d.get("encoding")))
+        break
+PY
+}
+
+# Message-type key differs between builds: the npm prebuilt (0.0.7) emits
+# "message_type", the current source emits "type". Matching only "type" made a
+# perfectly working tap look like a permissions failure — the metadata was right
+# there in the log, under the other key.
+log_has_error() {
+  grep -qE '"(message_)?type"[[:space:]]*:[[:space:]]*"error"' "$1" 2>/dev/null
+}
+
+show_log_errors() {
+  local log="$1"
+  [[ -s "$log" ]] || return 0
+  python3 - "$log" <<'PY' 2>/dev/null || true
+import json, sys
+for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
+    line = line.strip()
+    if not line.startswith("{"):
+        continue
+    try:
+        msg = json.loads(line)
+    except Exception:
+        continue
+    if (msg.get("type") or msg.get("message_type")) == "error":
+        d = msg.get("data") or {}
+        print("  %s" % d.get("message", ""))
+        for k, v in (d.get("context") or {}).items():
+            print("    %s: %s" % (k, v))
+PY
+}
+
+# macOS attributes audio-capture permission to the RESPONSIBLE process, which
+# for anything started from a shell is the terminal application — not the script
+# and not the audiotee binary. On macOS 26 plain executables do not appear in the
+# privacy UI at all (Apple DTS has confirmed this as a regression), so looking
+# for this script in that list is guaranteed to fail.
+print_permission_help() {
+  cat <<'EOF'
+
+  Grant the permission to your TERMINAL, not to this script:
+
+    System Settings → Privacy & Security → Screen & System Audio Recording
+      → scroll to the "System Audio Recording Only" section (a separate list
+        below the main one)
+      → enable Terminal / iTerm / Visual Studio Code — whichever you run this in
+
+  You will NOT find "taprec" or "audiotee" in that list.
+  Scripts and plain executables never appear there; the terminal that launched
+  them is what holds the permission.
+
+  If your terminal is not listed at all, it has not requested the permission
+  yet. Apps only appear once they ask. Terminal.app prompts reliably; iTerm and
+  the VS Code terminal often do not. Easiest fix:
+
+    open -a Terminal
+    cd "$(pwd)" && ./taprec --check
+
+  Accept the prompt there, and the permission then applies whenever you record
+  from that terminal.
+
+EOF
+}
+
+# ------------------------------------------------------------------ modes ----
+
+if [[ "$MODE" == "toolchain" ]]; then
+  check_macos_version
+  echo "Toolchain report"
+  echo "================"
+  echo
+  echo "macOS            : $(sw_vers -productVersion 2>/dev/null)"
+  echo "xcode-select -p  : $(xcode-select -p 2>/dev/null || echo unknown)"
+  echo
+  if toolchain_ok ""; then
+    echo "active           : Swift ${TC_SWIFT} / SDK ${TC_SDK}   OK"
+  else
+    echo "active           : Swift ${TC_SWIFT:-?} / SDK ${TC_SDK:-?}   too old"
+  fi
+  if [[ -d /Library/Developer/CommandLineTools ]]; then
+    if toolchain_ok /Library/Developer/CommandLineTools; then
+      echo "CommandLineTools : Swift ${TC_SWIFT} / SDK ${TC_SDK}   OK"
+    else
+      echo "CommandLineTools : Swift ${TC_SWIFT:-?} / SDK ${TC_SDK:-?}   too old"
+    fi
+  else
+    echo "CommandLineTools : not installed"
+  fi
+  echo
+  echo "needed for stereo: Swift >= 5.9 AND macOS SDK >= 14.2"
+  echo
+  if pick_toolchain >/dev/null 2>&1; then
+    c_grn "✔ A usable toolchain is available — you can build stereo now:"
+    echo
+    echo "    $0 --install --from-source"
+    echo "    $0 --check          # should report 2 ch"
+  else
+    c_ylw "✗ No toolchain new enough yet."
+    c_dim "  Install the current \"Command Line Tools for Xcode\" from"
+    c_dim "  https://developer.apple.com/download/all/ then re-run this."
+    c_dim "  Mono recording keeps working in the meantime."
+  fi
+  exit 0
+fi
+
+if [[ "$MODE" == "install" ]]; then
+  install_audiotee
+  exit 0
+fi
+
+check_macos_version
+command -v ffmpeg >/dev/null 2>&1 || die "ffmpeg not found — brew install ffmpeg"
+command -v python3 >/dev/null 2>&1 || die "python3 not found"
+
+if ! AUDIOTEE="$(find_audiotee)"; then
+  c_red "AudioTee is not built yet."
+  c_dim "run:  $0 --install"
+  exit 1
+fi
+
+if [[ "$MODE" == "check" ]]; then
+  detect_capabilities
+  build_audiotee_args
+  LOG="$(mktemp "${TMPDIR:-/tmp}/audiotee-check.XXXXXX")"
+  c_dim "starting a tap to verify permissions and format…"
+  "$AUDIOTEE" "${AT_ARGS[@]}" > /dev/null 2>"$LOG" &
+  AT_PID=$!
+
+  # Poll for the metadata message rather than sleeping a fixed 3s. AudioTee's own
+  # device-readiness loop alone can take 2.0s, plus process start and tap setup —
+  # a fixed 3s sleep could SIGINT it before it ever spoke, and then this check
+  # blamed permissions for a timing problem.
+  waited=0
+  while [[ "$waited" -lt 120 ]]; do        # up to ~12s
+    if grep -q '"metadata"' "$LOG" 2>/dev/null; then break; fi
+    if grep -qE '"(message_)?type"[[:space:]]*:[[:space:]]*"error"' "$LOG" 2>/dev/null; then break; fi
+    if ! kill -0 "$AT_PID" 2>/dev/null; then break; fi
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  # Let it stream briefly once it is up, so stream_start also lands.
+  sleep 1
+  kill -INT "$AT_PID" 2>/dev/null || true
+  wait "$AT_PID" 2>/dev/null || true
+  AT_PID=""
+  c_dim "  (tap ran for about $(awk -v w="$waited" 'BEGIN{printf "%.1f", w/10 + 1}')s)"
+
+  echo
+  if log_has_error "$LOG"; then
+    c_red "AudioTee reported an error:"
+    show_log_errors "$LOG"
+    echo
+    c_dim "If this mentions permissions, see the note below — the permission belongs"
+    c_dim "to your TERMINAL app, not to this script or the audiotee binary."
+    print_permission_help
+    exit 1
+  fi
+
+  if grep -qE '"(message_)?type"[[:space:]]*:[[:space:]]*"metadata"' "$LOG" 2>/dev/null; then
+    c_grn "✔ tap works — no BlackHole, no device switching."
+    report_stream_format "$LOG"
+    rm -f "$LOG"
+    echo
+    c_dim "next: $0 -t 30"
+    exit 0
+  fi
+
+  c_ylw "The tap produced no metadata — capture permission was almost certainly"
+  c_ylw "never granted. This fails silently: you get silence, not an error."
+  echo
+  c_ylw "  What AudioTee actually reported:"
+  if [[ -s "$LOG" ]]; then
+    sed 's/^/    /' "$LOG" | head -20
+  else
+    echo "    (nothing at all — the binary produced no output)"
+  fi
+  print_permission_help
+  c_dim "raw log kept at: $LOG"
+  exit 1
+fi
+
+# ------------------------------------------------------------------- main ----
+
+case "$FORMAT" in
+  wav)  codec=(-c:a pcm_s16le) ;;
+  m4a)  codec=(-c:a aac -b:a 192k) ;;
+  mp3)  codec=(-c:a libmp3lame -q:a 2) ;;
+  flac) codec=(-c:a flac) ;;
+  *)    die "unsupported format '$FORMAT' (use wav, m4a, mp3, or flac)" ;;
+esac
+
+case "$SAMPLE_RATE" in
+  8000|16000|22050|24000|32000|44100|48000) ;;
+  *) die "AudioTee supports 8000, 16000, 22050, 24000, 32000, 44100 or 48000 (got $SAMPLE_RATE)" ;;
+esac
+
+detect_capabilities
+build_audiotee_args
+
+c_dim "probing the tap for its actual output format…"
+if ! probe_stream_format; then
+  exit 1
+fi
+c_dim "  tap reports: ${DETECTED_RATE} Hz, ${DETECTED_CH} ch, ${DETECTED_ENC}"
+
+if [[ -z "$OUT_FILE" ]]; then
+  mkdir -p "$OUT_DIR"
+  OUT_FILE="$OUT_DIR/system-audio-$(date +%Y%m%d-%H%M%S).$FORMAT"
+else
+  mkdir -p "$(dirname "$OUT_FILE")"
+fi
+
+LOG="$(mktemp "${TMPDIR:-/tmp}/audiotee-log.XXXXXX")"
+PROGRESS_FILE="$(mktemp "${TMPDIR:-/tmp}/audiotee-progress.XXXXXX")"
+FIFO="$(mktemp -u "${TMPDIR:-/tmp}/audiotee-pipe.XXXXXX")"
+mkfifo "$FIFO"
+
+echo
+c_grn "▶ recording system audio → $OUT_FILE"
+c_dim "  via Core Audio tap (${DETECTED_RATE} Hz, ${DETECTED_CH} ch, ${DETECTED_ENC})"
+if [[ -n "$DURATION" ]]; then
+  c_dim "  stopping automatically after ${DURATION}s (Ctrl-C to stop early)"
+else
+  c_dim "  press Ctrl-C to stop"
+fi
+if [[ "$MUTE" -eq 1 ]]; then c_ylw "  --mute: the tapped apps will be silenced while recording"; fi
+echo
+
+# AudioTee writes raw PCM to stdout and JSON to stderr. Sending stdout through a
+# FIFO (rather than a plain pipeline) keeps its PID addressable, which is what
+# lets --duration stop it gracefully: SIGINT makes it close stdout, ffmpeg then
+# sees EOF and finalizes the container properly.
+"$AUDIOTEE" "${AT_ARGS[@]}" > "$FIFO" 2>"$LOG" &
+AT_PID=$!
+
+# AudioTee announces "stream_start" on stderr once the tap is delivering.
+# Arming the timer off that, rather than off process launch, makes -t mean
+# "N seconds of audio" instead of "N seconds including startup" — the latter
+# turned -t 5 into a 4.2s file.
+wait_for_stream_start() {
+  # 5s ceiling: real AudioTee announces at ~120ms. A 15s ceiling meant a build
+  # that never emits stream_start burned the whole timeout before the duration
+  # clock even started — a -t 5 request produced a 20s file.
+  local tries=0
+  while [[ "$tries" -lt 50 ]]; do
+    grep -q '"stream_start"' "$LOG" 2>/dev/null && return 0
+    kill -0 "$AT_PID" 2>/dev/null || return 1
+    sleep 0.1
+    tries=$((tries + 1))
+  done
+  return 1
+}
+
+# The timer waits for stream_start INSIDE a background subshell. It cannot wait
+# out here: opening the FIFO for writing blocks until a reader appears, and the
+# reader is the ffmpeg below — waiting first deadlocked AudioTee before it could
+# emit anything.
+if [[ -n "$DURATION" ]]; then
+  (
+    # Only wait for the announcement if the probe proved this build makes one.
+    if [[ "$PROBE_SAW_METADATA" -eq 1 ]]; then
+      wait_for_stream_start || true
+    fi
+    sleep "$DURATION"
+    kill -INT "$AT_PID" 2>/dev/null || true
+  ) &
+  TIMER_PID=$!
+fi
+
+# Input parameters come from the probe, not from what we asked for. Telling
+# ffmpeg the wrong channel count misreads every frame and yields a file at the
+# wrong speed — the exact failure class we spent this whole session chasing.
+ffmpeg -hide_banner -loglevel warning -stats \
+  -progress "$PROGRESS_FILE" \
+  -f "$FFMPEG_INFMT" -ar "$DETECTED_RATE" -ac "$DETECTED_CH" \
+  -i "$FIFO" \
+  "${codec[@]}" "$OUT_FILE" || true
+
+if [[ -n "$TIMER_PID" ]]; then kill "$TIMER_PID" 2>/dev/null || true; fi
+TIMER_PID=""
+if kill -0 "$AT_PID" 2>/dev/null; then
+  kill -INT "$AT_PID" 2>/dev/null || true
+fi
+wait "$AT_PID" 2>/dev/null || true
+AT_PID=""
+
+echo
+if [[ -s "$OUT_FILE" ]]; then
+  size="$(du -h "$OUT_FILE" | cut -f1 | tr -d ' ')"
+  dur_exact="$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$OUT_FILE" 2>/dev/null || true)"
+  dur="${dur_exact%%.*}"
+  c_grn "✔ saved $OUT_FILE (${size}${dur:+, ${dur}s})"
+  report_stream_format "$LOG"
+  if [[ "$OPEN_AFTER" -eq 1 ]] && command -v open >/dev/null 2>&1; then
+    open -R "$OUT_FILE" 2>/dev/null || true
+  fi
+
+  # The recording run writes its own metadata to $LOG. Compare it against the
+  # parameters we handed ffmpeg. If they disagree, every frame was misread and
+  # the file plays at the wrong speed — worth shouting about rather than
+  # letting it pass as a good recording.
+  actual="$(python3 - "$LOG" <<'PYEOF' 2>/dev/null || true
+import json, sys
+for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
+    line = line.strip()
+    if not line.startswith("{"):
+        continue
+    try:
+        m = json.loads(line)
+    except Exception:
+        continue
+    if (m.get("type") or m.get("message_type")) == "metadata":
+        d = m.get("data") or {}
+        print("%s %s" % (str(d.get("sample_rate")).split(".")[0], d.get("channels_per_frame")))
+        break
+PYEOF
+)"
+  if [[ -n "$actual" ]]; then
+    a_rate="$(printf '%s' "$actual" | awk '{print $1}')"
+    a_ch="$(printf '%s' "$actual" | awk '{print $2}')"
+    if [[ "$a_rate" != "$DETECTED_RATE" || "$a_ch" != "$DETECTED_CH" ]]; then
+      c_red "  ⚠ FORMAT MISMATCH — this file will play at the wrong speed."
+      c_red "     tap produced ${a_rate} Hz / ${a_ch} ch, but it was decoded as ${DETECTED_RATE} Hz / ${DETECTED_CH} ch."
+      c_dim "     re-run with: -r ${a_rate} $([[ "$a_ch" == "1" ]] && echo --mono || echo --stereo)"
+    fi
+  fi
+
+  # NOTE: deliberately no ffmpeg "speed" check here. On the BlackHole recorder
+  # that number is meaningful because ffmpeg reads a live capture device, so
+  # media-time vs wall-time reflects the device clock. Here ffmpeg reads a pipe,
+  # and speed just reflects how fast the FIFO drains — it reads well above 1.0x
+  # while buffers catch up and would fire false warnings.
+  #
+  # What IS meaningful: with -t, the timer starts at stream_start, so the file
+  # should contain very close to the requested number of seconds. A large
+  # shortfall means audio went missing.
+  # Compare against the FULL-precision duration, not the truncated display
+  # value — using "5" for a 5.80s file reported a phantom 16.7% shortfall.
+  if [[ -n "$DURATION" && -n "${dur_exact:-}" ]]; then
+    short="$(awk -v want="$DURATION" -v got="$dur_exact" 'BEGIN {
+      if (want + 0 <= 0) { print "0"; exit } printf "%.1f", (want - got) / want * 100 }')"
+    if awk -v s="$short" 'BEGIN { exit !(s > 5) }'; then
+      c_ylw "  ⚠ asked for ${DURATION}s but captured ${dur_exact}s (${short}% short) — audio may have been dropped."
+    fi
+  fi
+  rm -f "$LOG"
+else
+  c_red "recording produced an empty file."
+  if log_has_error "$LOG"; then
+    echo
+    c_red "AudioTee reported:"
+    show_log_errors "$LOG"
+  else
+    c_dim "was anything actually playing? The tap only captures apps producing audio."
+  fi
+  c_dim "run '$0 --check' to test the tap on its own. Log: $LOG"
+  exit 1
+fi
