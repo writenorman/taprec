@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- `install.sh` — installs to `~/.local/bin` for one user, or
+  `sudo ./install.sh --system` to `/usr/local/bin` for everyone on the machine.
+  A shared install also copies the AudioTee binary to
+  `<prefix>/libexec/taprec/`, so other users don't each need `taprec --install`.
+  `--uninstall` reverses it; `--prefix` targets somewhere else.
+- `find_audiotee` now also looks in `../libexec/taprec/` relative to the
+  running script, and in `/usr/local/libexec/taprec/`. A per-user AudioTee
+  still takes precedence over the shared copy.
+
 ## 1.0.0
 
 First release.

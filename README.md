@@ -56,8 +56,36 @@ and smoke-tests it before use. Nothing is compiled and no toolchain is required.
 To put it on your `PATH`:
 
 ```bash
-ln -s "$PWD/taprec" /usr/local/bin/taprec
+./install.sh            # just you  ->  ~/.local/bin
 ```
+
+### For everyone on the Mac
+
+```bash
+sudo ./install.sh --system
+```
+
+That installs `taprec` into `/usr/local/bin` — already on every user's `PATH`
+via `/etc/paths` — and copies the AudioTee binary to
+`/usr/local/libexec/taprec/audiotee`, which `taprec` finds relative to its own
+location. Without that copy every user would have to run `taprec --install`
+separately in their own home.
+
+Two things a system install still can't do on other users' behalf:
+
+- **Audio permission is per-user.** macOS grants it to the terminal
+  application, one user at a time. Everyone who wants to record has to approve
+  their own terminal once — see [Permissions](#permissions). `taprec --check`
+  reports whether the current user is set up.
+- **Homebrew's `ffmpeg` may not be on their `PATH`.** Homebrew is added to
+  `PATH` by *your* shell profile, not system-wide. To fix that for everyone:
+
+  ```bash
+  echo /opt/homebrew/bin | sudo tee /etc/paths.d/homebrew
+  ```
+
+`./install.sh --uninstall` (with the same `--system` or `--prefix`) removes
+what it installed. Your AudioTee install and your recordings are left alone.
 
 ### Stereo
 
@@ -211,6 +239,7 @@ with the caveats in this README.
 
 ```
 taprec              the recorder
+install.sh          installer — per-user, or --system for everyone
 tools/
   verify-recording.sh   measure a recording against its source
   diagnose-audio.sh     tone-based capture diagnostics

@@ -190,11 +190,19 @@ find_audiotee() {
   # Our own managed install wins over anything on PATH. Otherwise a stray
   # `audiotee` elsewhere silently shadows the binary --install just produced,
   # and you get the old build's behaviour right after upgrading.
+  # A shared copy next to the installed script, resolved relative to where
+  # taprec itself lives. This is what makes a system-wide install work for
+  # every user without each of them running --install in their own home.
+  local self_dir
+  self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || echo .)"
+
   local candidate
   for candidate in \
     "$AUDIOTEE_HOME/bin/audiotee" \
     "$AUDIOTEE_HOME/src/.build/release/audiotee" \
     "$AUDIOTEE_HOME/.build/release/audiotee" \
+    "$self_dir/../libexec/taprec/audiotee" \
+    "/usr/local/libexec/taprec/audiotee" \
     "$(command -v audiotee 2>/dev/null || true)" \
     "./audiotee/.build/release/audiotee" \
     "./.build/release/audiotee"
