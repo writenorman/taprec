@@ -37,7 +37,7 @@ back to your speakers first:
 
 ```bash
 # if you still have the CLI installed
-macos-audio connect local "Built-in Output"
+macos-audio connect local "Built-in Output"   # or whatever your speakers are called
 # or just use System Settings › Sound
 ```
 
@@ -97,11 +97,9 @@ as they are — taprec doesn't care about them, since it doesn't route through a
 device. But if you want your original setup back, check each device's **Format**
 in Audio MIDI Setup.
 
-For reference, the state that was left behind:
-
-- Built-in Output — 48000 Hz
-- External Display — 48000 Hz
-- BlackHole 2ch — 48000 Hz *(being removed)*
+The working configuration was simply: every device in the capture path set to
+the same rate. 48 kHz is a sensible default for everything, so there is usually
+no reason to change it back.
 
 48 kHz is a sensible default for everything, so there's usually no reason to
 change it back.

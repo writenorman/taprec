@@ -1,6 +1,7 @@
-recordings/
-*.wav
+
+*.flac
 *.m4a
 *.mp3
-*.flac
+*.wav
 .DS_Store
+recordings/
